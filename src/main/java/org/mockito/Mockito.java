@@ -1,1243 +1,916 @@
-package mindustry.input;
+/*
+ * This file is part of Baritone.
+ *
+ * Baritone is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * Baritone is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with Baritone.  If not, see <https://www.gnu.org/licenses/>.
+ */
 
-import arc.*;
-import arc.func.*;
-import arc.graphics.*;
-import arc.graphics.g2d.*;
-import arc.input.*;
-import arc.input.GestureDetector.*;
-import arc.math.*;
-import arc.math.geom.*;
-import arc.scene.*;
-import arc.scene.event.*;
-import arc.scene.ui.layout.*;
-import arc.struct.*;
-import arc.util.*;
-import mindustry.ai.formations.patterns.*;
-import mindustry.annotations.Annotations.*;
-import mindustry.content.*;
-import mindustry.core.*;
-import mindustry.entities.*;
-import mindustry.entities.units.*;
-import mindustry.game.EventType.*;
-import mindustry.game.*;
-import mindustry.game.Teams.*;
-import mindustry.gen.*;
-import mindustry.graphics.*;
-import mindustry.input.Placement.*;
-import mindustry.net.Administration.*;
-import mindustry.net.*;
-import mindustry.type.*;
-import mindustry.ui.fragments.*;
-import mindustry.world.*;
-import mindustry.world.blocks.*;
-import mindustry.world.blocks.ConstructBlock.*;
-import mindustry.world.blocks.payloads.*;
-import mindustry.world.blocks.power.*;
-import mindustry.world.blocks.storage.CoreBlock.*;
-import mindustry.world.meta.*;
+package baritone.process;
 
+import baritone.Baritone;
+import baritone.api.pathing.goals.Goal;
+import baritone.api.pathing.goals.GoalBlock;
+import baritone.api.pathing.goals.GoalComposite;
+import baritone.api.pathing.goals.GoalGetToBlock;
+import baritone.api.process.IBuilderProcess;
+import baritone.api.process.PathingCommand;
+import baritone.api.process.PathingCommandType;
+import baritone.api.schematic.FillSchematic;
+import baritone.api.schematic.ISchematic;
+import baritone.api.schematic.IStaticSchematic;
+import baritone.api.schematic.format.ISchematicFormat;
+import baritone.api.utils.BetterBlockPos;
+import baritone.api.utils.RayTraceUtils;
+import baritone.api.utils.Rotation;
+import baritone.api.utils.RotationUtils;
+import baritone.api.utils.input.Input;
+import baritone.pathing.movement.CalculationContext;
+import baritone.pathing.movement.Movement;
+import baritone.pathing.movement.MovementHelper;
+import baritone.utils.BaritoneProcessHelper;
+import baritone.utils.BlockStateInterface;
+import baritone.utils.NotificationHelper;
+import baritone.utils.PathingCommandContext;
+import baritone.utils.schematic.MapArtSchematic;
+import baritone.utils.schematic.SchematicSystem;
+import baritone.utils.schematic.schematica.SchematicaHelper;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import net.minecraft.block.BlockAir;
+import net.minecraft.block.BlockLiquid;
+import net.minecraft.block.state.IBlockState;
+import net.minecraft.init.Blocks;
+import net.minecraft.item.ItemBlock;
+import net.minecraft.item.ItemStack;
+import net.minecraft.util.EnumFacing;
+import net.minecraft.util.Tuple;
+import net.minecraft.util.math.*;
+
+import java.io.File;
+import java.io.FileInputStream;
 import java.util.*;
+import java.util.stream.Collectors;
 
-import static mindustry.Vars.*;
+import static baritone.api.pathing.movement.ActionCosts.COST_INF;
 
-public abstract class InputHandler implements InputProcessor, GestureListener{
-    /** Used for dropping items. */
-    final static float playerSelectRange = mobile ? 17f : 11f;
-    /** Maximum line length. */
-    final static int maxLength = 100;
-    final static Rect r1 = new Rect(), r2 = new Rect();
-    final static Seq<Point2> tmpPoints = new Seq<>(), tmpPoints2 = new Seq<>();
+public final class BuilderProcess extends BaritoneProcessHelper implements IBuilderProcess {
 
-    public final OverlayFragment frag = new OverlayFragment();
+    private HashSet<BetterBlockPos> incorrectPositions;
+    private LongOpenHashSet observedCompleted; // positions that are completed even if they're out of render distance and we can't make sure right now
+    private String name;
+    private ISchematic realSchematic;
+    private ISchematic schematic;
+    private Vec3i origin;
+    private int ticks;
+    private boolean paused;
+    private int layer;
+    private int numRepeats;
+    private List<IBlockState> approxPlaceable;
 
-    public Interval controlInterval = new Interval();
-    public @Nullable Block block;
-    public boolean overrideLineRotation;
-    public int rotation;
-    public boolean droppingItem;
-    public Group uiGroup;
-    public boolean isBuilding = true, buildWasAutoPaused = false, wasShooting = false;
-    public @Nullable UnitType controlledType;
-
-    public @Nullable Schematic lastSchematic;
-    public GestureDetector detector;
-    public PlaceLine line = new PlaceLine();
-    public BuildPlan resultreq;
-    public BuildPlan brequest = new BuildPlan();
-    public Seq<BuildPlan> lineRequests = new Seq<>();
-    public Seq<BuildPlan> selectRequests = new Seq<>();
-
-    //methods to override
-
-    @Remote(called = Loc.server, unreliable = true)
-    public static void transferItemEffect(Item item, float x, float y, Itemsc to){
-        if(to == null) return;
-        createItemTransfer(item, 1, x, y, to, null);
+    public BuilderProcess(Baritone baritone) {
+        super(baritone);
     }
 
-    @Remote(called = Loc.server, unreliable = true)
-    public static void takeItems(Building build, Item item, int amount, Unit to){
-        if(to == null || build == null) return;
-
-        int removed = build.removeStack(item, Math.min(to.maxAccepted(item), amount));
-        if(removed == 0) return;
-
-        to.addItem(item, removed);
-        for(int j = 0; j < Mathf.clamp(removed / 3, 1, 8); j++){
-            Time.run(j * 3f, () -> transferItemEffect(item, build.x, build.y, to));
+    @Override
+    public void build(String name, ISchematic schematic, Vec3i origin) {
+        this.name = name;
+        this.schematic = schematic;
+        this.realSchematic = null;
+        int x = origin.getX();
+        int y = origin.getY();
+        int z = origin.getZ();
+        if (Baritone.settings().schematicOrientationX.value) {
+            x += schematic.widthX();
         }
-    }
-
-    @Remote(called = Loc.server, unreliable = true)
-    public static void transferItemToUnit(Item item, float x, float y, Itemsc to){
-        if(to == null) return;
-        createItemTransfer(item, 1, x, y, to, () -> to.addItem(item));
-    }
-
-    @Remote(called = Loc.server, unreliable = true)
-    public static void setItem(Building build, Item item, int amount){
-        if(build == null || build.items == null) return;
-        build.items.set(item, amount);
-    }
-
-    @Remote(called = Loc.server, unreliable = true)
-    public static void transferItemTo(@Nullable Unit unit, Item item, int amount, float x, float y, Building build){
-        if(build == null || build.items == null) return;
-
-        if(unit != null && unit.item() == item) unit.stack.amount = Math.max(unit.stack.amount - amount, 0);
-
-        for(int i = 0; i < Mathf.clamp(amount / 3, 1, 8); i++){
-            Time.run(i * 3, () -> createItemTransfer(item, amount, x, y, build, () -> {}));
+        if (Baritone.settings().schematicOrientationY.value) {
+            y += schematic.heightY();
         }
-        build.handleStack(item, amount, unit);
-    }
-
-    public static void createItemTransfer(Item item, int amount, float x, float y, Position to, Runnable done){
-        Fx.itemTransfer.at(x, y, amount, item.color, to);
-        if(done != null){
-            Time.run(Fx.itemTransfer.lifetime, done);
+        if (Baritone.settings().schematicOrientationZ.value) {
+            z += schematic.lengthZ();
         }
+        this.origin = new Vec3i(x, y, z);
+        this.paused = false;
+        this.layer = Baritone.settings().startAtLayer.value;
+        this.numRepeats = 0;
+        this.observedCompleted = new LongOpenHashSet();
     }
 
-    @Remote(called = Loc.server, targets = Loc.both, forward = true)
-    public static void requestItem(Player player, Building tile, Item item, int amount){
-        if(player == null || tile == null || !tile.interactable(player.team()) || !player.within(tile, buildingRange) || player.dead()) return;
+    public void resume() {
+        paused = false;
+    }
 
-        if(net.server() && (!Units.canInteract(player, tile) ||
-        !netServer.admins.allowAction(player, ActionType.withdrawItem, tile.tile(), action -> {
-            action.item = item;
-            action.itemAmount = amount;
-        }))){
-            throw new ValidateException(player, "Player cannot request items.");
+    public void pause() {
+        paused = true;
+    }
+
+    @Override
+    public boolean isPaused() {
+        return paused;
+    }
+
+    @Override
+    public boolean build(String name, File schematic, Vec3i origin) {
+        Optional<ISchematicFormat> format = SchematicSystem.INSTANCE.getByFile(schematic);
+        if (!format.isPresent()) {
+            return false;
         }
 
-        //remove item for every controlling unit
-        player.unit().eachGroup(unit -> {
-            Call.takeItems(tile, item, unit.maxAccepted(item), unit);
+        ISchematic parsed;
+        try {
+            parsed = format.get().parse(new FileInputStream(schematic));
+        } catch (Exception e) {
+            e.printStackTrace();
+            return false;
+        }
 
-            if(unit == player.unit()){
-                Events.fire(new WithdrawEvent(tile, player, item, amount));
+        if (Baritone.settings().mapArtMode.value) {
+            parsed = new MapArtSchematic((IStaticSchematic) parsed);
+        }
+
+        build(name, parsed, origin);
+        return true;
+    }
+
+    @Override
+    public void buildOpenSchematic() {
+        if (SchematicaHelper.isSchematicaPresent()) {
+            Optional<Tuple<IStaticSchematic, BlockPos>> schematic = SchematicaHelper.getOpenSchematic();
+            if (schematic.isPresent()) {
+                IStaticSchematic s = schematic.get().getFirst();
+                this.build(
+                        schematic.get().getFirst().toString(),
+                        Baritone.settings().mapArtMode.value ? new MapArtSchematic(s) : s,
+                        schematic.get().getSecond()
+                );
+            } else {
+                logDirect("No schematic currently open");
             }
-        });
-    }
-
-    @Remote(targets = Loc.both, forward = true, called = Loc.server)
-    public static void transferInventory(Player player, Building tile){
-        if(player == null || tile == null || !player.within(tile, buildingRange) || tile.items == null || player.dead()) return;
-
-        if(net.server() && (player.unit().stack.amount <= 0 || !Units.canInteract(player, tile) ||
-        !netServer.admins.allowAction(player, ActionType.depositItem, tile.tile, action -> {
-            action.itemAmount = player.unit().stack.amount;
-            action.item = player.unit().item();
-        }))){
-            throw new ValidateException(player, "Player cannot transfer an item.");
-        }
-
-        //deposit for every controlling unit
-        player.unit().eachGroup(unit -> {
-            Item item = unit.item();
-            int accepted = tile.acceptStack(item, unit.stack.amount, unit);
-
-            Call.transferItemTo(unit, item, accepted, unit.x, unit.y, tile);
-
-            if(unit == player.unit()){
-                Events.fire(new DepositEvent(tile, player, item, accepted));
-            }
-        });
-    }
-
-    @Remote(variants = Variant.one)
-    public static void removeQueueBlock(int x, int y, boolean breaking){
-        player.unit().removeBuild(x, y, breaking);
-    }
-
-    @Remote(targets = Loc.both, called = Loc.server)
-    public static void requestUnitPayload(Player player, Unit target){
-        if(player == null) return;
-
-        Unit unit = player.unit();
-        Payloadc pay = (Payloadc)unit;
-
-        if(target.isAI() && target.isGrounded() && pay.canPickup(target)
-        && target.within(unit, unit.type.hitSize * 2f + target.type.hitSize * 2f)){
-            Call.pickedUnitPayload(unit, target);
+        } else {
+            logDirect("Schematica is not present");
         }
     }
 
-    @Remote(targets = Loc.both, called = Loc.server)
-    public static void requestBuildPayload(Player player, Building tile){
-        if(player == null) return;
-
-        Unit unit = player.unit();
-        Payloadc pay = (Payloadc)unit;
-
-        if(tile != null && tile.team == unit.team
-        && unit.within(tile, tilesize * tile.block.size * 1.2f + tilesize * 5f)){
-            //pick up block directly
-            if(tile.block.buildVisibility != BuildVisibility.hidden && tile.canPickup() && pay.canPickup(tile)){
-                Call.pickedBuildPayload(unit, tile, true);
-            }else{ //pick up block payload
-                Payload current = tile.getPayload();
-                if(current != null && pay.canPickupPayload(current)){
-                    Call.pickedBuildPayload(unit, tile, false);
-                }
-            }
-        }
+    public void clearArea(BlockPos corner1, BlockPos corner2) {
+        BlockPos origin = new BlockPos(Math.min(corner1.getX(), corner2.getX()), Math.min(corner1.getY(), corner2.getY()), Math.min(corner1.getZ(), corner2.getZ()));
+        int widthX = Math.abs(corner1.getX() - corner2.getX()) + 1;
+        int heightY = Math.abs(corner1.getY() - corner2.getY()) + 1;
+        int lengthZ = Math.abs(corner1.getZ() - corner2.getZ()) + 1;
+        build("clear area", new FillSchematic(widthX, heightY, lengthZ, Blocks.AIR.getDefaultState()), origin);
     }
 
-    @Remote(targets = Loc.server, called = Loc.server)
-    public static void pickedUnitPayload(Unit unit, Unit target){
-        if(target != null && unit instanceof Payloadc pay){
-            pay.pickup(target);
-        }else if(target != null){
-            target.remove();
-        }
+    @Override
+    public List<IBlockState> getApproxPlaceable() {
+        return new ArrayList<>(approxPlaceable);
     }
 
-    @Remote(targets = Loc.server, called = Loc.server)
-    public static void pickedBuildPayload(Unit unit, Building tile, boolean onGround){
-        if(tile != null && unit instanceof Payloadc pay){
-            if(onGround){
-                if(tile.block.buildVisibility != BuildVisibility.hidden && tile.canPickup() && pay.canPickup(tile)){
-                    pay.pickup(tile);
-                }else{
-                    Fx.unitPickup.at(tile);
-                    tile.tile.remove();
-                }
-            }else{
-                Payload current = tile.getPayload();
-                if(current != null && pay.canPickupPayload(current)){
-                    Payload taken = tile.takePayload();
-                    if(taken != null){
-                        pay.addPayload(taken);
-                        Fx.unitPickup.at(tile);
+    @Override
+    public boolean isActive() {
+        return schematic != null;
+    }
+
+    public IBlockState placeAt(int x, int y, int z, IBlockState current) {
+        if (!isActive()) {
+            return null;
+        }
+        if (!schematic.inSchematic(x - origin.getX(), y - origin.getY(), z - origin.getZ(), current)) {
+            return null;
+        }
+        IBlockState state = schematic.desiredState(x - origin.getX(), y - origin.getY(), z - origin.getZ(), current, this.approxPlaceable);
+        if (state.getBlock() == Blocks.AIR) {
+            return null;
+        }
+        return state;
+    }
+
+    private Optional<Tuple<BetterBlockPos, Rotation>> toBreakNearPlayer(BuilderCalculationContext bcc) {
+        BetterBlockPos center = ctx.playerFeet();
+        BetterBlockPos pathStart = baritone.getPathingBehavior().pathStart();
+        for (int dx = -5; dx <= 5; dx++) {
+            for (int dy = Baritone.settings().breakFromAbove.value ? -1 : 0; dy <= 5; dy++) {
+                for (int dz = -5; dz <= 5; dz++) {
+                    int x = center.x + dx;
+                    int y = center.y + dy;
+                    int z = center.z + dz;
+                    if (dy == -1 && x == pathStart.x && z == pathStart.z) {
+                        continue; // dont mine what we're supported by, but not directly standing on
+                    }
+                    IBlockState desired = bcc.getSchematic(x, y, z, bcc.bsi.get0(x, y, z));
+                    if (desired == null) {
+                        continue; // irrelevant
+                    }
+                    IBlockState curr = bcc.bsi.get0(x, y, z);
+                    if (curr.getBlock() != Blocks.AIR && !(curr.getBlock() instanceof BlockLiquid) && !valid(curr, desired, false)) {
+                        BetterBlockPos pos = new BetterBlockPos(x, y, z);
+                        Optional<Rotation> rot = RotationUtils.reachable(ctx.player(), pos, ctx.playerController().getBlockReachDistance());
+                        if (rot.isPresent()) {
+                            return Optional.of(new Tuple<>(pos, rot.get()));
+                        }
                     }
                 }
             }
+        }
+        return Optional.empty();
+    }
 
-        }else if(tile != null && onGround){
-            Fx.unitPickup.at(tile);
-            tile.tile.remove();
+    public static class Placement {
+
+        private final int hotbarSelection;
+        private final BlockPos placeAgainst;
+        private final EnumFacing side;
+        private final Rotation rot;
+
+        public Placement(int hotbarSelection, BlockPos placeAgainst, EnumFacing side, Rotation rot) {
+            this.hotbarSelection = hotbarSelection;
+            this.placeAgainst = placeAgainst;
+            this.side = side;
+            this.rot = rot;
         }
     }
 
-    @Remote(targets = Loc.both, called = Loc.server)
-    public static void requestDropPayload(Player player, float x, float y){
-        if(player == null || net.client()) return;
-
-        Payloadc pay = (Payloadc)player.unit();
-
-        //apply margin of error
-        Tmp.v1.set(x, y).sub(pay).limit(tilesize * 4f).add(pay);
-        float cx = Tmp.v1.x, cy = Tmp.v1.y;
-
-        Call.payloadDropped(player.unit(), cx, cy);
-    }
-
-    @Remote(called = Loc.server, targets = Loc.server)
-    public static void payloadDropped(Unit unit, float x, float y){
-        if(unit instanceof Payloadc pay){
-            float prevx = pay.x(), prevy = pay.y();
-            pay.set(x, y);
-            pay.dropLastPayload();
-            pay.set(prevx, prevy);
-            pay.controlling().each(u -> {
-                if(u instanceof Payloadc){
-                    Call.payloadDropped(u, u.x, u.y);
-                }
-            });
-        }
-    }
-
-    @Remote(targets = Loc.client, called = Loc.server)
-    public static void dropItem(Player player, float angle){
-        if(player == null) return;
-
-        if(net.server() && player.unit().stack.amount <= 0){
-            throw new ValidateException(player, "Player cannot drop an item.");
-        }
-
-        Fx.dropItem.at(player.x, player.y, angle, Color.white, player.unit().item());
-        player.unit().clearItem();
-    }
-
-    @Remote(targets = Loc.both, called = Loc.server, forward = true, unreliable = true)
-    public static void rotateBlock(@Nullable Player player, Building tile, boolean direction){
-        if(tile == null) return;
-
-        if(net.server() && (!Units.canInteract(player, tile) ||
-            !netServer.admins.allowAction(player, ActionType.rotate, tile.tile(), action -> action.rotation = Mathf.mod(tile.rotation + Mathf.sign(direction), 4)))){
-            throw new ValidateException(player, "Player cannot rotate a block.");
-        }
-
-        if(player != null) tile.lastAccessed = player.name;
-        tile.rotation = Mathf.mod(tile.rotation + Mathf.sign(direction), 4);
-        tile.updateProximity();
-        tile.noSleep();
-    }
-
-    @Remote(targets = Loc.both, called = Loc.both, forward = true)
-    public static void tileConfig(@Nullable Player player, Building tile, @Nullable Object value){
-        if(tile == null) return;
-        if(net.server() && (!Units.canInteract(player, tile) ||
-            !netServer.admins.allowAction(player, ActionType.configure, tile.tile, action -> action.config = value))) throw new ValidateException(player, "Player cannot configure a tile.");
-        tile.configured(player == null || player.dead() ? null : player.unit(), value);
-        Core.app.post(() -> Events.fire(new ConfigEvent(tile, player, value)));
-    }
-
-    //only useful for servers or local mods, and is not replicated across clients
-    //uses unreliable packets due to high frequency
-    @Remote(targets = Loc.both, called = Loc.both, unreliable = true)
-    public static void tileTap(@Nullable Player player, Tile tile){
-        if(tile == null) return;
-
-        Events.fire(new TapEvent(player, tile));
-    }
-
-    @Remote(targets = Loc.both, called = Loc.both, forward = true)
-    public static void unitControl(Player player, @Nullable Unit unit){
-        if(player == null) return;
-
-        //make sure player is allowed to control the unit
-        if(net.server() && !netServer.admins.allowAction(player, ActionType.control, action -> action.unit = unit)){
-            throw new ValidateException(player, "Player cannot control a unit.");
-        }
-
-        //clear player unit when they possess a core
-        if(unit instanceof BlockUnitc block && block.tile() instanceof CoreBuild build){
-            Fx.spawn.at(player);
-            if(net.client()){
-                control.input.controlledType = null;
-            }
-
-            player.clearUnit();
-            player.deathTimer = 61f;
-            build.requestSpawn(player);
-        }else if(unit == null){ //just clear the unit (is this used?)
-            player.clearUnit();
-            //make sure it's AI controlled, so players can't overwrite each other
-        }else if(unit.isAI() && unit.team == player.team() && !unit.dead){
-            if(!net.client()){
-                player.unit(unit);
-            }
-
-            Time.run(Fx.unitSpirit.lifetime, () -> Fx.unitControl.at(unit.x, unit.y, 0f, unit));
-            if(!player.dead()){
-                Fx.unitSpirit.at(player.x, player.y, 0f, unit);
-            }
-        }
-
-        Events.fire(new UnitControlEvent(player, unit));
-    }
-
-    @Remote(targets = Loc.both, called = Loc.both, forward = true)
-    public static void unitClear(Player player){
-        //no free core teleports?
-        if(player == null || !player.dead() && player.unit().spawnedByCore) return;
-
-        Fx.spawn.at(player);
-        player.clearUnit();
-        player.deathTimer = 61f; //for instant respawn
-    }
-
-    @Remote(targets = Loc.both, called = Loc.server, forward = true)
-    public static void unitCommand(Player player){
-        if(player == null || player.dead() || !(player.unit() instanceof Commanderc commander)) return;
-
-        //make sure player is allowed to make the command
-        if(net.server() && !netServer.admins.allowAction(player, ActionType.command, action -> {})){
-            throw new ValidateException(player, "Player cannot command a unit.");
-        }
-
-        if(commander.isCommanding()){
-            commander.clearCommand();
-        }else if(player.unit().type.commandLimit > 0){
-
-            //TODO try out some other formations
-            commander.commandNearby(new CircleFormation());
-            Fx.commandSend.at(player);
-        }
-
-    }
-
-    public Eachable<BuildPlan> allRequests(){
-        return cons -> {
-            for(BuildPlan request : player.unit().plans()) cons.get(request);
-            for(BuildPlan request : selectRequests) cons.get(request);
-            for(BuildPlan request : lineRequests) cons.get(request);
-        };
-    }
-
-    public boolean isUsingSchematic(){
-        return !selectRequests.isEmpty();
-    }
-
-    public OverlayFragment getFrag(){
-        return frag;
-    }
-
-    public void update(){
-        player.typing = ui.chatfrag.shown();
-
-        if(player.isBuilder()){
-            player.unit().updateBuilding(isBuilding);
-        }
-
-        if(player.shooting && !wasShooting && player.unit().hasWeapons() && state.rules.unitAmmo && player.unit().ammo <= 0){
-            player.unit().type.weapons.first().noAmmoSound.at(player.unit());
-        }
-
-        wasShooting = player.shooting;
-
-        if(!player.dead()){
-            controlledType = player.unit().type;
-        }
-
-        if(controlledType != null && player.dead()){
-            Unit unit = Units.closest(player.team(), player.x, player.y, u -> !u.isPlayer() && u.type == controlledType && !u.dead);
-
-            if(unit != null){
-                //only trying controlling once a second to prevent packet spam
-                if(!net.client() || controlInterval.get(0, 70f)){
-                    Call.unitControl(player, unit);
+    private Optional<Placement> searchForPlaceables(BuilderCalculationContext bcc, List<IBlockState> desirableOnHotbar) {
+        BetterBlockPos center = ctx.playerFeet();
+        for (int dx = -5; dx <= 5; dx++) {
+            for (int dy = -5; dy <= 1; dy++) {
+                for (int dz = -5; dz <= 5; dz++) {
+                    int x = center.x + dx;
+                    int y = center.y + dy;
+                    int z = center.z + dz;
+                    IBlockState desired = bcc.getSchematic(x, y, z, bcc.bsi.get0(x, y, z));
+                    if (desired == null) {
+                        continue; // irrelevant
+                    }
+                    IBlockState curr = bcc.bsi.get0(x, y, z);
+                    if (MovementHelper.isReplaceable(x, y, z, curr, bcc.bsi) && !valid(curr, desired, false)) {
+                        if (dy == 1 && bcc.bsi.get0(x, y + 1, z).getBlock() == Blocks.AIR) {
+                            continue;
+                        }
+                        desirableOnHotbar.add(desired);
+                        Optional<Placement> opt = possibleToPlace(desired, x, y, z, bcc.bsi);
+                        if (opt.isPresent()) {
+                            return opt;
+                        }
+                    }
                 }
             }
         }
+        return Optional.empty();
     }
 
-    public void checkUnit(){
-        if(controlledType != null){
-            Unit unit = Units.closest(player.team(), player.x, player.y, u -> !u.isPlayer() && u.type == controlledType && !u.dead);
-            if(unit == null && controlledType == UnitTypes.block){
-                unit = world.buildWorld(player.x, player.y) instanceof ControlBlock cont && cont.canControl() ? cont.unit() : null;
+    private Optional<Placement> possibleToPlace(IBlockState toPlace, int x, int y, int z, BlockStateInterface bsi) {
+        for (EnumFacing against : EnumFacing.values()) {
+            BetterBlockPos placeAgainstPos = new BetterBlockPos(x, y, z).offset(against);
+            IBlockState placeAgainstState = bsi.get0(placeAgainstPos);
+            if (MovementHelper.isReplaceable(placeAgainstPos.x, placeAgainstPos.y, placeAgainstPos.z, placeAgainstState, bsi)) {
+                continue;
             }
-
-            if(unit != null){
-                if(net.client()){
-                    Call.unitControl(player, unit);
-                }else{
-                    unit.controller(player);
+            if (!ctx.world().mayPlace(toPlace.getBlock(), new BetterBlockPos(x, y, z), false, against, null)) {
+                continue;
+            }
+            AxisAlignedBB aabb = placeAgainstState.getBoundingBox(ctx.world(), placeAgainstPos);
+            for (Vec3d placementMultiplier : aabbSideMultipliers(against)) {
+                double placeX = placeAgainstPos.x + aabb.minX * placementMultiplier.x + aabb.maxX * (1 - placementMultiplier.x);
+                double placeY = placeAgainstPos.y + aabb.minY * placementMultiplier.y + aabb.maxY * (1 - placementMultiplier.y);
+                double placeZ = placeAgainstPos.z + aabb.minZ * placementMultiplier.z + aabb.maxZ * (1 - placementMultiplier.z);
+                Rotation rot = RotationUtils.calcRotationFromVec3d(RayTraceUtils.inferSneakingEyePosition(ctx.player()), new Vec3d(placeX, placeY, placeZ), ctx.playerRotations());
+                RayTraceResult result = RayTraceUtils.rayTraceTowards(ctx.player(), rot, ctx.playerController().getBlockReachDistance(), true);
+                if (result != null && result.typeOfHit == RayTraceResult.Type.BLOCK && result.getBlockPos().equals(placeAgainstPos) && result.sideHit == against.getOpposite()) {
+                    OptionalInt hotbar = hasAnyItemThatWouldPlace(toPlace, result, rot);
+                    if (hotbar.isPresent()) {
+                        return Optional.of(new Placement(hotbar.getAsInt(), placeAgainstPos, against.getOpposite(), rot));
+                    }
                 }
             }
         }
+        return Optional.empty();
     }
 
-    public void tryPickupPayload(){
-        Unit unit = player.unit();
-        if(!(unit instanceof Payloadc pay)) return;
-
-        Unit target = Units.closest(player.team(), pay.x(), pay.y(), unit.type.hitSize * 2.5f, u -> u.isAI() && u.isGrounded() && pay.canPickup(u) && u.within(unit, u.hitSize + unit.hitSize * 1.2f));
-        if(target != null){
-            Call.requestUnitPayload(player, target);
-        }else{
-            Building tile = world.buildWorld(pay.x(), pay.y());
-
-            if(tile != null && tile.team == unit.team){
-                Call.requestBuildPayload(player, tile);
+    private OptionalInt hasAnyItemThatWouldPlace(IBlockState desired, RayTraceResult result, Rotation rot) {
+        for (int i = 0; i < 9; i++) {
+            ItemStack stack = ctx.player().inventory.mainInventory.get(i);
+            if (stack.isEmpty() || !(stack.getItem() instanceof ItemBlock)) {
+                continue;
+            }
+            float originalYaw = ctx.player().rotationYaw;
+            float originalPitch = ctx.player().rotationPitch;
+            // the state depends on the facing of the player sometimes
+            ctx.player().rotationYaw = rot.getYaw();
+            ctx.player().rotationPitch = rot.getPitch();
+            IBlockState wouldBePlaced = ((ItemBlock) stack.getItem()).getBlock().getStateForPlacement(
+                    ctx.world(),
+                    result.getBlockPos().offset(result.sideHit),
+                    result.sideHit,
+                    (float) result.hitVec.x - result.getBlockPos().getX(), // as in PlayerControllerMP
+                    (float) result.hitVec.y - result.getBlockPos().getY(),
+                    (float) result.hitVec.z - result.getBlockPos().getZ(),
+                    stack.getItem().getMetadata(stack.getMetadata()),
+                    ctx.player()
+            );
+            ctx.player().rotationYaw = originalYaw;
+            ctx.player().rotationPitch = originalPitch;
+            if (valid(wouldBePlaced, desired, true)) {
+                return OptionalInt.of(i);
             }
         }
+        return OptionalInt.empty();
     }
 
-    public void tryDropPayload(){
-        Unit unit = player.unit();
-        if(!(unit instanceof Payloadc)) return;
-
-        Call.requestDropPayload(player, player.x, player.y);
-    }
-
-    public float getMouseX(){
-        return Core.input.mouseX();
-    }
-
-    public float getMouseY(){
-        return Core.input.mouseY();
-    }
-
-    public void buildPlacementUI(Table table){
-
-    }
-
-    public void buildUI(Group group){
-
-    }
-
-    public void updateState(){
-        if(state.isMenu()){
-            controlledType = null;
+    private static Vec3d[] aabbSideMultipliers(EnumFacing side) {
+        switch (side) {
+            case UP:
+                return new Vec3d[]{new Vec3d(0.5, 1, 0.5), new Vec3d(0.1, 1, 0.5), new Vec3d(0.9, 1, 0.5), new Vec3d(0.5, 1, 0.1), new Vec3d(0.5, 1, 0.9)};
+            case DOWN:
+                return new Vec3d[]{new Vec3d(0.5, 0, 0.5), new Vec3d(0.1, 0, 0.5), new Vec3d(0.9, 0, 0.5), new Vec3d(0.5, 0, 0.1), new Vec3d(0.5, 0, 0.9)};
+            case NORTH:
+            case SOUTH:
+            case EAST:
+            case WEST:
+                double x = side.getXOffset() == 0 ? 0.5 : (1 + side.getXOffset()) / 2D;
+                double z = side.getZOffset() == 0 ? 0.5 : (1 + side.getZOffset()) / 2D;
+                return new Vec3d[]{new Vec3d(x, 0.25, z), new Vec3d(x, 0.75, z)};
+            default: // null
+                throw new IllegalStateException();
         }
     }
 
-    public void drawBottom(){
-
-    }
-
-    public void drawTop(){
-
-    }
-
-    public void drawOverSelect(){
-
-    }
-
-    public void drawSelected(int x, int y, Block block, Color color){
-        Drawf.selected(x, y, block, color);
-    }
-
-    public void drawBreaking(BuildPlan request){
-        if(request.breaking){
-            drawBreaking(request.x, request.y);
-        }else{
-            drawSelected(request.x, request.y, request.block, Pal.remove);
+    @Override
+    public PathingCommand onTick(boolean calcFailed, boolean isSafeToCancel) {
+        approxPlaceable = approxPlaceable(36);
+        if (baritone.getInputOverrideHandler().isInputForcedDown(Input.CLICK_LEFT)) {
+            ticks = 5;
+        } else {
+            ticks--;
         }
-    }
-
-    public boolean requestMatches(BuildPlan request){
-        Tile tile = world.tile(request.x, request.y);
-        return tile != null && tile.block() instanceof ConstructBlock && tile.<ConstructBuild>bc().cblock == request.block;
-    }
-
-    public void drawBreaking(int x, int y){
-        Tile tile = world.tile(x, y);
-        if(tile == null) return;
-        Block block = tile.block();
-
-        drawSelected(x, y, block, Pal.remove);
-    }
-
-    public void useSchematic(Schematic schem){
-        selectRequests.addAll(schematics.toRequests(schem, player.tileX(), player.tileY()));
-    }
-
-    protected void showSchematicSave(){
-        if(lastSchematic == null) return;
-
-        ui.showTextInput("@schematic.add", "@name", "", text -> {
-            Schematic replacement = schematics.all().find(s -> s.name().equals(text));
-            if(replacement != null){
-                ui.showConfirm("@confirm", "@schematic.replace", () -> {
-                    schematics.overwrite(replacement, lastSchematic);
-                    ui.showInfoFade("@schematic.saved");
-                    ui.schematics.showInfo(replacement);
-                });
-            }else{
-                lastSchematic.tags.put("name", text);
-                lastSchematic.tags.put("description", "");
-                schematics.add(lastSchematic);
-                ui.showInfoFade("@schematic.saved");
-                ui.schematics.showInfo(lastSchematic);
-                Events.fire(new SchematicCreateEvent(lastSchematic));
+        baritone.getInputOverrideHandler().clearAllKeys();
+        if (paused) {
+            return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
+        }
+        if (Baritone.settings().buildInLayers.value) {
+            if (realSchematic == null) {
+                realSchematic = schematic;
             }
-        });
-    }
-
-    public void rotateRequests(Seq<BuildPlan> requests, int direction){
-        int ox = schemOriginX(), oy = schemOriginY();
-
-        requests.each(req -> {
-            req.pointConfig(p -> {
-                int cx = p.x, cy = p.y;
-                int lx = cx;
-
-                if(direction >= 0){
-                    cx = -cy;
-                    cy = lx;
-                }else{
-                    cx = cy;
-                    cy = -lx;
+            ISchematic realSchematic = this.realSchematic; // wrap this properly, dont just have the inner class refer to the builderprocess.this
+            int minYInclusive;
+            int maxYInclusive;
+            // layer = 0 should be nothing
+            // layer = realSchematic.heightY() should be everything
+            if (Baritone.settings().layerOrder.value) { // top to bottom
+                maxYInclusive = realSchematic.heightY() - 1;
+                minYInclusive = realSchematic.heightY() - layer;
+            } else {
+                maxYInclusive = layer - 1;
+                minYInclusive = 0;
+            }
+            schematic = new ISchematic() {
+                @Override
+                public IBlockState desiredState(int x, int y, int z, IBlockState current, List<IBlockState> approxPlaceable) {
+                    return realSchematic.desiredState(x, y, z, current, BuilderProcess.this.approxPlaceable);
                 }
-                p.set(cx, cy);
-            });
 
-            //rotate actual request, centered on its multiblock position
-            float wx = (req.x - ox) * tilesize + req.block.offset, wy = (req.y - oy) * tilesize + req.block.offset;
-            float x = wx;
-            if(direction >= 0){
-                wx = -wy;
-                wy = x;
-            }else{
-                wx = wy;
-                wy = -x;
-            }
-            req.x = World.toTile(wx - req.block.offset) + ox;
-            req.y = World.toTile(wy - req.block.offset) + oy;
-            req.rotation = Mathf.mod(req.rotation + direction, 4);
-        });
-    }
-
-    public void flipRequests(Seq<BuildPlan> requests, boolean x){
-        int origin = (x ? schemOriginX() : schemOriginY()) * tilesize;
-
-        requests.each(req -> {
-            float value = -((x ? req.x : req.y) * tilesize - origin + req.block.offset) + origin;
-
-            if(x){
-                req.x = (int)((value - req.block.offset) / tilesize);
-            }else{
-                req.y = (int)((value - req.block.offset) / tilesize);
-            }
-
-            req.pointConfig(p -> {
-                int corigin = x ? req.originalWidth/2 : req.originalHeight/2;
-                int nvalue = -(x ? p.x : p.y);
-                if(x){
-                    req.originalX = -(req.originalX - corigin) + corigin;
-                    p.x = nvalue;
-                }else{
-                    req.originalY = -(req.originalY - corigin) + corigin;
-                    p.y = nvalue;
+                @Override
+                public boolean inSchematic(int x, int y, int z, IBlockState currentState) {
+                    return ISchematic.super.inSchematic(x, y, z, currentState) && y >= minYInclusive && y <= maxYInclusive && realSchematic.inSchematic(x, y, z, currentState);
                 }
-            });
 
-            //flip rotation
-            if(x == (req.rotation % 2 == 0)){
-                req.rotation = Mathf.mod(req.rotation + 2, 4);
-            }
-        });
-    }
-
-    protected int schemOriginX(){
-        return rawTileX();
-    }
-
-    protected int schemOriginY(){
-        return rawTileY();
-    }
-
-    /** Returns the selection request that overlaps this position, or null. */
-    protected BuildPlan getRequest(int x, int y){
-        return getRequest(x, y, 1, null);
-    }
-
-    /** Returns the selection request that overlaps this position, or null. */
-    protected BuildPlan getRequest(int x, int y, int size, BuildPlan skip){
-        float offset = ((size + 1) % 2) * tilesize / 2f;
-        r2.setSize(tilesize * size);
-        r2.setCenter(x * tilesize + offset, y * tilesize + offset);
-        resultreq = null;
-
-        Boolf<BuildPlan> test = req -> {
-            if(req == skip) return false;
-            Tile other = req.tile();
-
-            if(other == null) return false;
-
-            if(!req.breaking){
-                r1.setSize(req.block.size * tilesize);
-                r1.setCenter(other.worldx() + req.block.offset, other.worldy() + req.block.offset);
-            }else{
-                r1.setSize(other.block().size * tilesize);
-                r1.setCenter(other.worldx() + other.block().offset, other.worldy() + other.block().offset);
-            }
-
-            return r2.overlaps(r1);
-        };
-
-        for(BuildPlan req : player.unit().plans()){
-            if(test.get(req)) return req;
-        }
-
-        return selectRequests.find(test);
-    }
-
-    protected void drawBreakSelection(int x1, int y1, int x2, int y2, int maxLength){
-        NormalizeDrawResult result = Placement.normalizeDrawArea(Blocks.air, x1, y1, x2, y2, false, maxLength, 1f);
-        NormalizeResult dresult = Placement.normalizeArea(x1, y1, x2, y2, rotation, false, maxLength);
-
-        for(int x = dresult.x; x <= dresult.x2; x++){
-            for(int y = dresult.y; y <= dresult.y2; y++){
-                Tile tile = world.tileBuilding(x, y);
-                if(tile == null || !validBreak(tile.x, tile.y)) continue;
-
-                drawBreaking(tile.x, tile.y);
-            }
-        }
-
-        Tmp.r1.set(result.x, result.y, result.x2 - result.x, result.y2 - result.y);
-
-        Draw.color(Pal.remove);
-        Lines.stroke(1f);
-
-        for(BuildPlan req : player.unit().plans()){
-            if(req.breaking) continue;
-            if(req.bounds(Tmp.r2).overlaps(Tmp.r1)){
-                drawBreaking(req);
-            }
-        }
-
-        for(BuildPlan req : selectRequests){
-            if(req.breaking) continue;
-            if(req.bounds(Tmp.r2).overlaps(Tmp.r1)){
-                drawBreaking(req);
-            }
-        }
-
-        for(BlockPlan req : player.team().data().blocks){
-            Block block = content.block(req.block);
-            if(block.bounds(req.x, req.y, Tmp.r2).overlaps(Tmp.r1)){
-                drawSelected(req.x, req.y, content.block(req.block), Pal.remove);
-            }
-        }
-
-        Lines.stroke(2f);
-
-        Draw.color(Pal.removeBack);
-        Lines.rect(result.x, result.y - 1, result.x2 - result.x, result.y2 - result.y);
-        Draw.color(Pal.remove);
-        Lines.rect(result.x, result.y, result.x2 - result.x, result.y2 - result.y);
-    }
-
-    protected void drawBreakSelection(int x1, int y1, int x2, int y2){
-        drawBreakSelection(x1, y1, x2, y2, maxLength);
-    }
-
-    protected void drawSelection(int x1, int y1, int x2, int y2, int maxLength){
-        NormalizeDrawResult result = Placement.normalizeDrawArea(Blocks.air, x1, y1, x2, y2, false, maxLength, 1f);
-
-        Lines.stroke(2f);
-
-        Draw.color(Pal.accentBack);
-        Lines.rect(result.x, result.y - 1, result.x2 - result.x, result.y2 - result.y);
-        Draw.color(Pal.accent);
-        Lines.rect(result.x, result.y, result.x2 - result.x, result.y2 - result.y);
-    }
-
-    protected void flushSelectRequests(Seq<BuildPlan> requests){
-        for(BuildPlan req : requests){
-            if(req.block != null && validPlace(req.x, req.y, req.block, req.rotation)){
-                BuildPlan other = getRequest(req.x, req.y, req.block.size, null);
-                if(other == null){
-                    selectRequests.add(req.copy());
-                }else if(!other.breaking && other.x == req.x && other.y == req.y && other.block.size == req.block.size){
-                    selectRequests.remove(other);
-                    selectRequests.add(req.copy());
+                @Override
+                public int widthX() {
+                    return realSchematic.widthX();
                 }
-            }
-        }
-    }
 
-    protected void flushRequests(Seq<BuildPlan> requests){
-        for(BuildPlan req : requests){
-            if(req.block != null && validPlace(req.x, req.y, req.block, req.rotation)){
-                BuildPlan copy = req.copy();
-                player.unit().addBuild(copy);
-            }
-        }
-    }
-
-    protected void drawOverRequest(BuildPlan request){
-        boolean valid = validPlace(request.x, request.y, request.block, request.rotation);
-
-        Draw.reset();
-        Draw.mixcol(!valid ? Pal.breakInvalid : Color.white, (!valid ? 0.4f : 0.24f) + Mathf.absin(Time.globalTime, 6f, 0.28f));
-        Draw.alpha(1f);
-        request.block.drawRequestConfigTop(request, selectRequests);
-        Draw.reset();
-    }
-
-    protected void drawRequest(BuildPlan request){
-        request.block.drawRequest(request, allRequests(), validPlace(request.x, request.y, request.block, request.rotation));
-    }
-
-    /** Draws a placement icon for a specific block. */
-    protected void drawRequest(int x, int y, Block block, int rotation){
-        brequest.set(x, y, rotation, block);
-        brequest.animScale = 1f;
-        block.drawRequest(brequest, allRequests(), validPlace(x, y, block, rotation));
-    }
-
-    /** Remove everything from the queue in a selection. */
-    protected void removeSelection(int x1, int y1, int x2, int y2){
-        removeSelection(x1, y1, x2, y2, false);
-    }
-
-    /** Remove everything from the queue in a selection. */
-    protected void removeSelection(int x1, int y1, int x2, int y2, int maxLength){
-        removeSelection(x1, y1, x2, y2, false, maxLength);
-    }
-
-    /** Remove everything from the queue in a selection. */
-    protected void removeSelection(int x1, int y1, int x2, int y2, boolean flush){
-        removeSelection(x1, y1, x2, y2, flush, maxLength);
-    }
-
-    /** Remove everything from the queue in a selection. */
-    protected void removeSelection(int x1, int y1, int x2, int y2, boolean flush, int maxLength){
-        NormalizeResult result = Placement.normalizeArea(x1, y1, x2, y2, rotation, false, maxLength);
-        for(int x = 0; x <= Math.abs(result.x2 - result.x); x++){
-            for(int y = 0; y <= Math.abs(result.y2 - result.y); y++){
-                int wx = x1 + x * Mathf.sign(x2 - x1);
-                int wy = y1 + y * Mathf.sign(y2 - y1);
-
-                Tile tile = world.tileBuilding(wx, wy);
-
-                if(tile == null) continue;
-
-                if(!flush){
-                    tryBreakBlock(wx, wy);
-                }else if(validBreak(tile.x, tile.y) && !selectRequests.contains(r -> r.tile() != null && r.tile() == tile)){
-                    selectRequests.add(new BuildPlan(tile.x, tile.y));
+                @Override
+                public int heightY() {
+                    return realSchematic.heightY();
                 }
-            }
-        }
 
-        //remove build requests
-        Tmp.r1.set(result.x * tilesize, result.y * tilesize, (result.x2 - result.x) * tilesize, (result.y2 - result.y) * tilesize);
-
-        Iterator<BuildPlan> it = player.unit().plans().iterator();
-        while(it.hasNext()){
-            BuildPlan req = it.next();
-            if(!req.breaking && req.bounds(Tmp.r2).overlaps(Tmp.r1)){
-                it.remove();
-            }
-        }
-
-        it = selectRequests.iterator();
-        while(it.hasNext()){
-            BuildPlan req = it.next();
-            if(!req.breaking && req.bounds(Tmp.r2).overlaps(Tmp.r1)){
-                it.remove();
-            }
-        }
-
-        //remove blocks to rebuild
-        Iterator<BlockPlan> broken = state.teams.get(player.team()).blocks.iterator();
-        while(broken.hasNext()){
-            BlockPlan req = broken.next();
-            Block block = content.block(req.block);
-            if(block.bounds(req.x, req.y, Tmp.r2).overlaps(Tmp.r1)){
-                broken.remove();
-            }
-        }
-    }
-
-    protected void updateLine(int x1, int y1, int x2, int y2){
-        lineRequests.clear();
-        iterateLine(x1, y1, x2, y2, l -> {
-            rotation = l.rotation;
-            BuildPlan req = new BuildPlan(l.x, l.y, l.rotation, block, block.nextConfig());
-            req.animScale = 1f;
-            lineRequests.add(req);
-        });
-
-        if(Core.settings.getBool("blockreplace")){
-            lineRequests.each(req -> {
-                Block replace = req.block.getReplacement(req, lineRequests);
-                if(replace.unlockedNow()){
-                    req.block = replace;
+                @Override
+                public int lengthZ() {
+                    return realSchematic.lengthZ();
                 }
-            });
+            };
         }
-    }
-
-    protected void updateLine(int x1, int y1){
-        updateLine(x1, y1, tileX(getMouseX()), tileY(getMouseY()));
-    }
-
-    /** Handles tile tap events that are not platform specific. */
-    boolean tileTapped(@Nullable Building tile){
-        if(tile == null){
-            frag.inv.hide();
-            frag.config.hideConfig();
-            return false;
-        }
-        boolean consumed = false, showedInventory = false;
-
-        //check if tapped block is configurable
-        if(tile.block.configurable && tile.interactable(player.team())){
-            consumed = true;
-            if(((!frag.config.isShown() && tile.shouldShowConfigure(player)) //if the config fragment is hidden, show
-            //alternatively, the current selected block can 'agree' to switch config tiles
-            || (frag.config.isShown() && frag.config.getSelectedTile().onConfigureTileTapped(tile)))){
-                Sounds.click.at(tile);
-                frag.config.showConfig(tile);
+        BuilderCalculationContext bcc = new BuilderCalculationContext();
+        if (!recalc(bcc)) {
+            if (Baritone.settings().buildInLayers.value && layer < realSchematic.heightY()) {
+                logDirect("Starting layer " + layer);
+                layer++;
+                return onTick(calcFailed, isSafeToCancel);
             }
-            //otherwise...
-        }else if(!frag.config.hasConfigMouse()){ //make sure a configuration fragment isn't on the cursor
-            //then, if it's shown and the current block 'agrees' to hide, hide it.
-            if(frag.config.isShown() && frag.config.getSelectedTile().onConfigureTileTapped(tile)){
-                consumed = true;
-                frag.config.hideConfig();
+            Vec3i repeat = Baritone.settings().buildRepeat.value;
+            int max = Baritone.settings().buildRepeatCount.value;
+            numRepeats++;
+            if (repeat.equals(new Vec3i(0, 0, 0)) || (max != -1 && numRepeats >= max)) {
+                logDirect("Done building");
+                if (Baritone.settings().desktopNotifications.value && Baritone.settings().notificationOnBuildFinished.value) {
+                    NotificationHelper.notify("Done building", false);
+                }
+                onLostControl();
+                return null;
             }
+            // build repeat time
+            layer = 0;
+            origin = new BlockPos(origin).add(repeat);
+            logDirect("Repeating build in vector " + repeat + ", new origin is " + origin);
+            return onTick(calcFailed, isSafeToCancel);
+        }
+        if (Baritone.settings().distanceTrim.value) {
+            trim();
+        }
 
-            if(frag.config.isShown()){
-                consumed = true;
+        Optional<Tuple<BetterBlockPos, Rotation>> toBreak = toBreakNearPlayer(bcc);
+        if (toBreak.isPresent() && isSafeToCancel && ctx.player().onGround) {
+            // we'd like to pause to break this block
+            // only change look direction if it's safe (don't want to fuck up an in progress parkour for example
+            Rotation rot = toBreak.get().getSecond();
+            BetterBlockPos pos = toBreak.get().getFirst();
+            baritone.getLookBehavior().updateTarget(rot, true);
+            MovementHelper.switchToBestToolFor(ctx, bcc.get(pos));
+            if (ctx.player().isSneaking()) {
+                // really horrible bug where a block is visible for breaking while sneaking but not otherwise
+                // so you can't see it, it goes to place something else, sneaks, then the next tick it tries to break
+                // and is unable since it's unsneaked in the intermediary tick
+                baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
             }
-        }
-
-        //call tapped event
-        if(!consumed && tile.interactable(player.team())){
-            tile.tapped();
-        }
-
-        //consume tap event if necessary
-        if(tile.interactable(player.team()) && tile.block.consumesTap){
-            consumed = true;
-        }else if(tile.interactable(player.team()) && tile.block.synthetic() && !consumed){
-            if(tile.block.hasItems && tile.items.total() > 0){
-                frag.inv.showFor(tile);
-                consumed = true;
-                showedInventory = true;
+            if (ctx.isLookingAt(pos) || ctx.playerRotations().isReallyCloseTo(rot)) {
+                baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_LEFT, true);
             }
+            return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
         }
-
-        if(!showedInventory){
-            frag.inv.hide();
-        }
-
-        return consumed;
-    }
-
-    /** Tries to select the player to drop off items, returns true if successful. */
-    boolean tryTapPlayer(float x, float y){
-        if(canTapPlayer(x, y)){
-            droppingItem = true;
-            return true;
-        }
-        return false;
-    }
-
-    boolean canTapPlayer(float x, float y){
-        return player.within(x, y, playerSelectRange) && player.unit().stack.amount > 0;
-    }
-
-    /** Tries to begin mining a tile, returns true if successful. */
-    boolean tryBeginMine(Tile tile){
-        if(canMine(tile)){
-            //if a block is clicked twice, reset it
-            player.unit().mineTile = player.unit().mineTile == tile ? null : tile;
-            return true;
-        }
-        return false;
-    }
-
-    boolean canMine(Tile tile){
-        return !Core.scene.hasMouse()
-            && tile.drop() != null
-            && player.unit().validMine(tile)
-            && !(tile.floor().playerUnmineable && tile.overlay().itemDrop == null)
-            && player.unit().acceptsItem(tile.drop())
-            && tile.block() == Blocks.air;
-    }
-
-    /** Returns the tile at the specified MOUSE coordinates. */
-    Tile tileAt(float x, float y){
-        return world.tile(tileX(x), tileY(y));
-    }
-
-    int rawTileX(){
-        return World.toTile(Core.input.mouseWorld().x);
-    }
-
-    int rawTileY(){
-        return World.toTile(Core.input.mouseWorld().y);
-    }
-
-    int tileX(float cursorX){
-        Vec2 vec = Core.input.mouseWorld(cursorX, 0);
-        if(selectedBlock()){
-            vec.sub(block.offset, block.offset);
-        }
-        return World.toTile(vec.x);
-    }
-
-    int tileY(float cursorY){
-        Vec2 vec = Core.input.mouseWorld(0, cursorY);
-        if(selectedBlock()){
-            vec.sub(block.offset, block.offset);
-        }
-        return World.toTile(vec.y);
-    }
-
-    public boolean selectedBlock(){
-        return isPlacing();
-    }
-
-    public boolean isPlacing(){
-        return block != null;
-    }
-
-    public boolean isBreaking(){
-        return false;
-    }
-
-    public float mouseAngle(float x, float y){
-        return Core.input.mouseWorld(getMouseX(), getMouseY()).sub(x, y).angle();
-    }
-
-    public @Nullable Unit selectedUnit(){
-        Unit unit = Units.closest(player.team(), Core.input.mouseWorld().x, Core.input.mouseWorld().y, 40f, Unitc::isAI);
-        if(unit != null){
-            unit.hitbox(Tmp.r1);
-            Tmp.r1.grow(6f);
-            if(Tmp.r1.contains(Core.input.mouseWorld())){
-                return unit;
+        List<IBlockState> desirableOnHotbar = new ArrayList<>();
+        Optional<Placement> toPlace = searchForPlaceables(bcc, desirableOnHotbar);
+        if (toPlace.isPresent() && isSafeToCancel && ctx.player().onGround && ticks <= 0) {
+            Rotation rot = toPlace.get().rot;
+            baritone.getLookBehavior().updateTarget(rot, true);
+            ctx.player().inventory.currentItem = toPlace.get().hotbarSelection;
+            baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
+            if ((ctx.isLookingAt(toPlace.get().placeAgainst) && ctx.objectMouseOver().sideHit.equals(toPlace.get().side)) || ctx.playerRotations().isReallyCloseTo(rot)) {
+                baritone.getInputOverrideHandler().setInputForceState(Input.CLICK_RIGHT, true);
             }
+            return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
         }
 
-        Building tile = world.buildWorld(Core.input.mouseWorld().x, Core.input.mouseWorld().y);
-        if(tile instanceof ControlBlock cont && cont.canControl() && tile.team == player.team()){
-            return cont.unit();
-        }
-
-        return null;
-    }
-
-    public void remove(){
-        Core.input.removeProcessor(this);
-        frag.remove();
-        if(Core.scene != null){
-            Table table = (Table)Core.scene.find("inputTable");
-            if(table != null){
-                table.clear();
-            }
-        }
-        if(detector != null){
-            Core.input.removeProcessor(detector);
-        }
-        if(uiGroup != null){
-            uiGroup.remove();
-            uiGroup = null;
-        }
-    }
-
-    public void add(){
-        Core.input.getInputProcessors().remove(i -> i instanceof InputHandler || (i instanceof GestureDetector && ((GestureDetector)i).getListener() instanceof InputHandler));
-        Core.input.addProcessor(detector = new GestureDetector(20, 0.5f, 0.3f, 0.15f, this));
-        Core.input.addProcessor(this);
-        if(Core.scene != null){
-            Table table = (Table)Core.scene.find("inputTable");
-            if(table != null){
-                table.clear();
-                buildPlacementUI(table);
-            }
-
-            uiGroup = new WidgetGroup();
-            uiGroup.touchable = Touchable.childrenOnly;
-            uiGroup.setFillParent(true);
-            ui.hudGroup.addChild(uiGroup);
-            uiGroup.toBack();
-            buildUI(uiGroup);
-
-            frag.add();
-        }
-    }
-
-    public boolean canShoot(){
-        return block == null && !onConfigurable() && !isDroppingItem() && !player.unit().activelyBuilding() &&
-            !(player.unit() instanceof Mechc && player.unit().isFlying());
-    }
-
-    public boolean onConfigurable(){
-        return false;
-    }
-
-    public boolean isDroppingItem(){
-        return droppingItem;
-    }
-
-    public boolean canDropItem(){
-        return droppingItem && !canTapPlayer(Core.input.mouseWorldX(), Core.input.mouseWorldY());
-    }
-
-    public void tryDropItems(@Nullable Building tile, float x, float y){
-        if(!droppingItem || player.unit().stack.amount <= 0 || canTapPlayer(x, y) || state.isPaused() ){
-            droppingItem = false;
-            return;
-        }
-
-        droppingItem = false;
-
-        ItemStack stack = player.unit().stack;
-
-        if(tile != null && tile.acceptStack(stack.item, stack.amount, player.unit()) > 0 && tile.interactable(player.team()) && tile.block.hasItems && player.unit().stack().amount > 0 && tile.interactable(player.team())){
-            Call.transferInventory(player, tile);
-        }else{
-            Call.dropItem(player.angleTo(x, y));
-        }
-    }
-
-    public void tryPlaceBlock(int x, int y){
-        if(block != null && validPlace(x, y, block, rotation)){
-            placeBlock(x, y, block, rotation);
-        }
-    }
-
-    public void tryBreakBlock(int x, int y){
-        if(validBreak(x, y)){
-            breakBlock(x, y);
-        }
-    }
-
-    public boolean validPlace(int x, int y, Block type, int rotation){
-        return validPlace(x, y, type, rotation, null);
-    }
-
-    public boolean validPlace(int x, int y, Block type, int rotation, BuildPlan ignore){
-        for(BuildPlan req : player.unit().plans()){
-            if(req != ignore
-                    && !req.breaking
-                    && req.block.bounds(req.x, req.y, Tmp.r1).overlaps(type.bounds(x, y, Tmp.r2))
-                    && !(type.canReplace(req.block) && Tmp.r1.equals(Tmp.r2))){
-                return false;
-            }
-        }
-        return Build.validPlace(type, player.team(), x, y, rotation);
-    }
-
-    public boolean validBreak(int x, int y){
-        return Build.validBreak(player.team(), x, y);
-    }
-
-    public void placeBlock(int x, int y, Block block, int rotation){
-        BuildPlan req = getRequest(x, y);
-        if(req != null){
-            player.unit().plans().remove(req);
-        }
-        player.unit().addBuild(new BuildPlan(x, y, rotation, block, block.nextConfig()));
-    }
-
-    public void breakBlock(int x, int y){
-        Tile tile = world.tile(x, y);
-        if(tile != null && tile.build != null) tile = tile.build.tile;
-        player.unit().addBuild(new BuildPlan(tile.x, tile.y));
-    }
-
-    public void drawArrow(Block block, int x, int y, int rotation){
-        drawArrow(block, x, y, rotation, validPlace(x, y, block, rotation));
-    }
-
-    public void drawArrow(Block block, int x, int y, int rotation, boolean valid){
-        float trns = (block.size / 2) * tilesize;
-        int dx = Geometry.d4(rotation).x, dy = Geometry.d4(rotation).y;
-
-        Draw.color(!valid ? Pal.removeBack : Pal.accentBack);
-        Draw.rect(Core.atlas.find("place-arrow"),
-        x * tilesize + block.offset + dx*trns,
-        y * tilesize + block.offset - 1 + dy*trns,
-        Core.atlas.find("place-arrow").width * Draw.scl,
-        Core.atlas.find("place-arrow").height * Draw.scl, rotation * 90 - 90);
-
-        Draw.color(!valid ? Pal.remove : Pal.accent);
-        Draw.rect(Core.atlas.find("place-arrow"),
-        x * tilesize + block.offset + dx*trns,
-        y * tilesize + block.offset + dy*trns,
-        Core.atlas.find("place-arrow").width * Draw.scl,
-        Core.atlas.find("place-arrow").height * Draw.scl, rotation * 90 - 90);
-    }
-
-    void iterateLine(int startX, int startY, int endX, int endY, Cons<PlaceLine> cons){
-        Seq<Point2> points;
-        boolean diagonal = Core.input.keyDown(Binding.diagonal_placement);
-
-        if(Core.settings.getBool("swapdiagonal") && mobile){
-            diagonal = !diagonal;
-        }
-
-        if(block instanceof PowerNode){
-            diagonal = !diagonal;
-        }
-
-        if(diagonal){
-            points = Placement.pathfindLine(block != null && block.conveyorPlacement, startX, startY, endX, endY);
-        }else{
-            points = Placement.normalizeLine(startX, startY, endX, endY);
-        }
-
-        if(block instanceof PowerNode node){
-            var base = tmpPoints2;
-            var result = tmpPoints.clear();
-
-            base.selectFrom(points, p -> p == points.first() || p == points.peek() || Build.validPlace(block, player.team(), p.x, p.y, rotation, false));
-            boolean addedLast = false;
-
+        if (Baritone.settings().allowInventory.value) {
+            ArrayList<Integer> usefulSlots = new ArrayList<>();
+            List<IBlockState> noValidHotbarOption = new ArrayList<>();
             outer:
-            for(int i = 0; i < base.size;){
-                var point = base.get(i);
-                result.add(point);
-                if(i == base.size - 1) addedLast = true;
-
-                //find the furthest node that overlaps this one
-                for(int j = base.size - 1; j > i; j--){
-                    var other = base.get(j);
-                    boolean over = node.overlaps(world.tile(point.x, point.y), world.tile(other.x, other.y));
-
-                    if(over){
-                        //add node to list and start searching for node that overlaps the next one
-                        i = j;
+            for (IBlockState desired : desirableOnHotbar) {
+                for (int i = 0; i < 9; i++) {
+                    if (valid(approxPlaceable.get(i), desired, true)) {
+                        usefulSlots.add(i);
                         continue outer;
                     }
                 }
-
-                //if it got here, that means nothing was found. try to proceed to the next node anyway
-                i ++;
+                noValidHotbarOption.add(desired);
             }
 
-            if(!addedLast) result.add(base.peek());
-
-            points.clear();
-            points.addAll(result);
-        }
-
-        float angle = Angles.angle(startX, startY, endX, endY);
-        int baseRotation = rotation;
-        if(!overrideLineRotation || diagonal){
-            baseRotation = (startX == endX && startY == endY) ? rotation : ((int)((angle + 45) / 90f)) % 4;
-        }
-
-        Tmp.r3.set(-1, -1, 0, 0);
-
-        for(int i = 0; i < points.size; i++){
-            Point2 point = points.get(i);
-
-            if(block != null && Tmp.r2.setSize(block.size * tilesize).setCenter(point.x * tilesize + block.offset, point.y * tilesize + block.offset).overlaps(Tmp.r3)){
-                continue;
-            }
-
-            Point2 next = i == points.size - 1 ? null : points.get(i + 1);
-            line.x = point.x;
-            line.y = point.y;
-            if(!overrideLineRotation || diagonal){
-                if(next != null){
-                    line.rotation = Tile.relativeTo(point.x, point.y, next.x, next.y);
-                }else if(block.conveyorPlacement && i > 0){
-                    Point2 prev = points.get(i - 1);
-                    line.rotation = Tile.relativeTo(prev.x, prev.y, point.x, point.y);
-                }else{
-                    line.rotation = baseRotation;
+            outer:
+            for (int i = 9; i < 36; i++) {
+                for (IBlockState desired : noValidHotbarOption) {
+                    if (valid(approxPlaceable.get(i), desired, true)) {
+                        baritone.getInventoryBehavior().attemptToPutOnHotbar(i, usefulSlots::contains);
+                        break outer;
+                    }
                 }
-            }else{
-                line.rotation = rotation;
             }
-            line.last = next == null;
-            cons.get(line);
+        }
 
-            Tmp.r3.setSize(block.size * tilesize).setCenter(point.x * tilesize + block.offset, point.y * tilesize + block.offset);
+        Goal goal = assemble(bcc, approxPlaceable.subList(0, 9));
+        if (goal == null) {
+            goal = assemble(bcc, approxPlaceable, true); // we're far away, so assume that we have our whole inventory to recalculate placeable properly
+            if (goal == null) {
+                if (Baritone.settings().skipFailedLayers.value && Baritone.settings().buildInLayers.value && layer < realSchematic.heightY()) {
+                    logDirect("Skipping layer that I cannot construct! Layer #" + layer);
+                    layer++;
+                    return onTick(calcFailed, isSafeToCancel);
+                }
+                logDirect("Unable to do it. Pausing. resume to resume, cancel to cancel");
+                paused = true;
+                return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
+            }
+        }
+        return new PathingCommandContext(goal, PathingCommandType.FORCE_REVALIDATE_GOAL_AND_PATH, bcc);
+    }
+
+    private boolean recalc(BuilderCalculationContext bcc) {
+        if (incorrectPositions == null) {
+            incorrectPositions = new HashSet<>();
+            fullRecalc(bcc);
+            if (incorrectPositions.isEmpty()) {
+                return false;
+            }
+        }
+        recalcNearby(bcc);
+        if (incorrectPositions.isEmpty()) {
+            fullRecalc(bcc);
+        }
+        return !incorrectPositions.isEmpty();
+    }
+
+    private void trim() {
+        HashSet<BetterBlockPos> copy = new HashSet<>(incorrectPositions);
+        copy.removeIf(pos -> pos.distanceSq(ctx.player().posX, ctx.player().posY, ctx.player().posZ) > 200);
+        if (!copy.isEmpty()) {
+            incorrectPositions = copy;
         }
     }
 
-    static class PlaceLine{
-        public int x, y, rotation;
-        public boolean last;
+    private void recalcNearby(BuilderCalculationContext bcc) {
+        BetterBlockPos center = ctx.playerFeet();
+        int radius = Baritone.settings().builderTickScanRadius.value;
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dy = -radius; dy <= radius; dy++) {
+                for (int dz = -radius; dz <= radius; dz++) {
+                    int x = center.x + dx;
+                    int y = center.y + dy;
+                    int z = center.z + dz;
+                    IBlockState desired = bcc.getSchematic(x, y, z, bcc.bsi.get0(x, y, z));
+                    if (desired != null) {
+                        // we care about this position
+                        BetterBlockPos pos = new BetterBlockPos(x, y, z);
+                        if (valid(bcc.bsi.get0(x, y, z), desired, false)) {
+                            incorrectPositions.remove(pos);
+                            observedCompleted.add(BetterBlockPos.longHash(pos));
+                        } else {
+                            incorrectPositions.add(pos);
+                            observedCompleted.remove(BetterBlockPos.longHash(pos));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private void fullRecalc(BuilderCalculationContext bcc) {
+        incorrectPositions = new HashSet<>();
+        for (int y = 0; y < schematic.heightY(); y++) {
+            for (int z = 0; z < schematic.lengthZ(); z++) {
+                for (int x = 0; x < schematic.widthX(); x++) {
+                    int blockX = x + origin.getX();
+                    int blockY = y + origin.getY();
+                    int blockZ = z + origin.getZ();
+                    IBlockState current = bcc.bsi.get0(blockX, blockY, blockZ);
+                    if (!schematic.inSchematic(x, y, z, current)) {
+                        continue;
+                    }
+                    if (bcc.bsi.worldContainsLoadedChunk(blockX, blockZ)) { // check if its in render distance, not if its in cache
+                        // we can directly observe this block, it is in render distance
+                        if (valid(bcc.bsi.get0(blockX, blockY, blockZ), schematic.desiredState(x, y, z, current, this.approxPlaceable), false)) {
+                            observedCompleted.add(BetterBlockPos.longHash(blockX, blockY, blockZ));
+                        } else {
+                            incorrectPositions.add(new BetterBlockPos(blockX, blockY, blockZ));
+                            observedCompleted.remove(BetterBlockPos.longHash(blockX, blockY, blockZ));
+                            if (incorrectPositions.size() > Baritone.settings().incorrectSize.value) {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                    // this is not in render distance
+                    if (!observedCompleted.contains(BetterBlockPos.longHash(blockX, blockY, blockZ))) {
+                        // and we've never seen this position be correct
+                        // therefore mark as incorrect
+                        incorrectPositions.add(new BetterBlockPos(blockX, blockY, blockZ));
+                        if (incorrectPositions.size() > Baritone.settings().incorrectSize.value) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private Goal assemble(BuilderCalculationContext bcc, List<IBlockState> approxPlaceable) {
+        return assemble(bcc, approxPlaceable, false);
+    }
+
+    private Goal assemble(BuilderCalculationContext bcc, List<IBlockState> approxPlaceable, boolean logMissing) {
+        List<BetterBlockPos> placeable = new ArrayList<>();
+        List<BetterBlockPos> breakable = new ArrayList<>();
+        List<BetterBlockPos> sourceLiquids = new ArrayList<>();
+        List<BetterBlockPos> flowingLiquids = new ArrayList<>();
+        Map<IBlockState, Integer> missing = new HashMap<>();
+        incorrectPositions.forEach(pos -> {
+            IBlockState state = bcc.bsi.get0(pos);
+            if (state.getBlock() instanceof BlockAir) {
+                if (approxPlaceable.contains(bcc.getSchematic(pos.x, pos.y, pos.z, state))) {
+                    placeable.add(pos);
+                } else {
+                    IBlockState desired = bcc.getSchematic(pos.x, pos.y, pos.z, state);
+                    missing.put(desired, 1 + missing.getOrDefault(desired, 0));
+                }
+            } else {
+                if (state.getBlock() instanceof BlockLiquid) {
+                    // if the block itself is JUST a liquid (i.e. not just a waterlogged block), we CANNOT break it
+                    // TODO for 1.13 make sure that this only matches pure water, not waterlogged blocks
+                    if (!MovementHelper.possiblyFlowing(state)) {
+                        // if it's a source block then we want to replace it with a throwaway
+                        sourceLiquids.add(pos);
+                    } else {
+                        flowingLiquids.add(pos);
+                    }
+                } else {
+                    breakable.add(pos);
+                }
+            }
+        });
+        List<Goal> toBreak = new ArrayList<>();
+        breakable.forEach(pos -> toBreak.add(breakGoal(pos, bcc)));
+        List<Goal> toPlace = new ArrayList<>();
+        placeable.forEach(pos -> {
+            if (!placeable.contains(pos.down()) && !placeable.contains(pos.down(2))) {
+                toPlace.add(placementGoal(pos, bcc));
+            }
+        });
+        sourceLiquids.forEach(pos -> toPlace.add(new GoalBlock(pos.up())));
+
+        if (!toPlace.isEmpty()) {
+            return new JankyGoalComposite(new GoalComposite(toPlace.toArray(new Goal[0])), new GoalComposite(toBreak.toArray(new Goal[0])));
+        }
+        if (toBreak.isEmpty()) {
+            if (logMissing && !missing.isEmpty()) {
+                logDirect("Missing materials for at least:");
+                logDirect(missing.entrySet().stream()
+                        .map(e -> String.format("%sx %s", e.getValue(), e.getKey()))
+                        .collect(Collectors.joining("\n")));
+            }
+            if (logMissing && !flowingLiquids.isEmpty()) {
+                logDirect("Unreplaceable liquids at at least:");
+                logDirect(flowingLiquids.stream()
+                        .map(p -> String.format("%s %s %s", p.x, p.y, p.z))
+                        .collect(Collectors.joining("\n")));
+            }
+            return null;
+        }
+        return new GoalComposite(toBreak.toArray(new Goal[0]));
+    }
+
+    public static class JankyGoalComposite implements Goal {
+
+        private final Goal primary;
+        private final Goal fallback;
+
+        public JankyGoalComposite(Goal primary, Goal fallback) {
+            this.primary = primary;
+            this.fallback = fallback;
+        }
+
+
+        @Override
+        public boolean isInGoal(int x, int y, int z) {
+            return primary.isInGoal(x, y, z) || fallback.isInGoal(x, y, z);
+        }
+
+        @Override
+        public double heuristic(int x, int y, int z) {
+            return primary.heuristic(x, y, z);
+        }
+
+        @Override
+        public String toString() {
+            return "JankyComposite Primary: " + primary + " Fallback: " + fallback;
+        }
+    }
+
+    public static class GoalBreak extends GoalGetToBlock {
+
+        public GoalBreak(BlockPos pos) {
+            super(pos);
+        }
+
+        @Override
+        public boolean isInGoal(int x, int y, int z) {
+            // can't stand right on top of a block, that might not work (what if it's unsupported, can't break then)
+            if (y > this.y) {
+                return false;
+            }
+            // but any other adjacent works for breaking, including inside or below
+            return super.isInGoal(x, y, z);
+        }
+    }
+
+    private Goal placementGoal(BlockPos pos, BuilderCalculationContext bcc) {
+        if (ctx.world().getBlockState(pos).getBlock() != Blocks.AIR) { // TODO can this even happen?
+            return new GoalPlace(pos);
+        }
+        boolean allowSameLevel = ctx.world().getBlockState(pos.up()).getBlock() != Blocks.AIR;
+        IBlockState current = ctx.world().getBlockState(pos);
+        for (EnumFacing facing : Movement.HORIZONTALS_BUT_ALSO_DOWN_____SO_EVERY_DIRECTION_EXCEPT_UP) {
+            //noinspection ConstantConditions
+            if (MovementHelper.canPlaceAgainst(ctx, pos.offset(facing)) && ctx.world().mayPlace(bcc.getSchematic(pos.getX(), pos.getY(), pos.getZ(), current).getBlock(), pos, false, facing, null)) {
+                return new GoalAdjacent(pos, pos.offset(facing), allowSameLevel);
+            }
+        }
+        return new GoalPlace(pos);
+    }
+
+    private Goal breakGoal(BlockPos pos, BuilderCalculationContext bcc) {
+        if (Baritone.settings().goalBreakFromAbove.value && bcc.bsi.get0(pos.up()).getBlock() instanceof BlockAir && bcc.bsi.get0(pos.up(2)).getBlock() instanceof BlockAir) { // TODO maybe possible without the up(2) check?
+            return new JankyGoalComposite(new GoalBreak(pos), new GoalGetToBlock(pos.up()) {
+                @Override
+                public boolean isInGoal(int x, int y, int z) {
+                    if (y > this.y || (x == this.x && y == this.y && z == this.z)) {
+                        return false;
+                    }
+                    return super.isInGoal(x, y, z);
+                }
+            });
+        }
+        return new GoalBreak(pos);
+    }
+
+    public static class GoalAdjacent extends GoalGetToBlock {
+
+        private boolean allowSameLevel;
+        private BlockPos no;
+
+        public GoalAdjacent(BlockPos pos, BlockPos no, boolean allowSameLevel) {
+            super(pos);
+            this.no = no;
+            this.allowSameLevel = allowSameLevel;
+        }
+
+        public boolean isInGoal(int x, int y, int z) {
+            if (x == this.x && y == this.y && z == this.z) {
+                return false;
+            }
+            if (x == no.getX() && y == no.getY() && z == no.getZ()) {
+                return false;
+            }
+            if (!allowSameLevel && y == this.y - 1) {
+                return false;
+            }
+            if (y < this.y - 1) {
+                return false;
+            }
+            return super.isInGoal(x, y, z);
+        }
+
+        public double heuristic(int x, int y, int z) {
+            // prioritize lower y coordinates
+            return this.y * 100 + super.heuristic(x, y, z);
+        }
+    }
+
+    public static class GoalPlace extends GoalBlock {
+
+        public GoalPlace(BlockPos placeAt) {
+            super(placeAt.up());
+        }
+
+        public double heuristic(int x, int y, int z) {
+            // prioritize lower y coordinates
+            return this.y * 100 + super.heuristic(x, y, z);
+        }
+    }
+
+    @Override
+    public void onLostControl() {
+        incorrectPositions = null;
+        name = null;
+        schematic = null;
+        realSchematic = null;
+        layer = Baritone.settings().startAtLayer.value;
+        numRepeats = 0;
+        paused = false;
+        observedCompleted = null;
+    }
+
+    @Override
+    public String displayName0() {
+        return paused ? "Builder Paused" : "Building " + name;
+    }
+
+    private List<IBlockState> approxPlaceable(int size) {
+        List<IBlockState> result = new ArrayList<>();
+        for (int i = 0; i < size; i++) {
+            ItemStack stack = ctx.player().inventory.mainInventory.get(i);
+            if (stack.isEmpty() || !(stack.getItem() instanceof ItemBlock)) {
+                result.add(Blocks.AIR.getDefaultState());
+                continue;
+            }
+            // <toxic cloud>
+            result.add(((ItemBlock) stack.getItem()).getBlock().getStateForPlacement(ctx.world(), ctx.playerFeet(), EnumFacing.UP, (float) ctx.player().posX, (float) ctx.player().posY, (float) ctx.player().posZ, stack.getItem().getMetadata(stack.getMetadata()), ctx.player()));
+            // </toxic cloud>
+        }
+        return result;
+    }
+
+    private boolean valid(IBlockState current, IBlockState desired, boolean itemVerify) {
+        if (desired == null) {
+            return true;
+        }
+        if (current.getBlock() instanceof BlockLiquid && Baritone.settings().okIfWater.value) {
+            return true;
+        }
+        if (current.getBlock() instanceof BlockAir && Baritone.settings().okIfAir.value.contains(desired.getBlock())) {
+            return true;
+        }
+        if (desired.getBlock() instanceof BlockAir && Baritone.settings().buildIgnoreBlocks.value.contains(current.getBlock())) {
+            return true;
+        }
+        if (!(current.getBlock() instanceof BlockAir) && Baritone.settings().buildIgnoreExisting.value && !itemVerify) {
+            return true;
+        }
+        return current.equals(desired);
+    }
+
+    public class BuilderCalculationContext extends CalculationContext {
+
+        private final List<IBlockState> placeable;
+        private final ISchematic schematic;
+        private final int originX;
+        private final int originY;
+        private final int originZ;
+
+        public BuilderCalculationContext() {
+            super(BuilderProcess.this.baritone, true); // wew lad
+            this.placeable = approxPlaceable(9);
+            this.schematic = BuilderProcess.this.schematic;
+            this.originX = origin.getX();
+            this.originY = origin.getY();
+            this.originZ = origin.getZ();
+
+            this.jumpPenalty += 10;
+            this.backtrackCostFavoringCoefficient = 1;
+        }
+
+        private IBlockState getSchematic(int x, int y, int z, IBlockState current) {
+            if (schematic.inSchematic(x - originX, y - originY, z - originZ, current)) {
+                return schematic.desiredState(x - originX, y - originY, z - originZ, current, BuilderProcess.this.approxPlaceable);
+            } else {
+                return null;
+            }
+        }
+
+        @Override
+        public double costOfPlacingAt(int x, int y, int z, IBlockState current) {
+            if (isPossiblyProtected(x, y, z) || !worldBorder.canPlaceAt(x, z)) { // make calculation fail properly if we can't build
+                return COST_INF;
+            }
+            IBlockState sch = getSchematic(x, y, z, current);
+            if (sch != null) {
+                // TODO this can return true even when allowPlace is off.... is that an issue?
+                if (sch.getBlock() == Blocks.AIR) {
+                    // we want this to be air, but they're asking if they can place here
+                    // this won't be a schematic block, this will be a throwaway
+                    return placeBlockCost * 2; // we're going to have to break it eventually
+                }
+                if (placeable.contains(sch)) {
+                    return 0; // thats right we gonna make it FREE to place a block where it should go in a structure
+                    // no place block penalty at all 😎
+                    // i'm such an idiot that i just tried to copy and paste the epic gamer moment emoji too
+                    // get added to unicode when?
+                }
+                if (!hasThrowaway) {
+                    return COST_INF;
+                }
+                // we want it to be something that we don't have
+                // even more of a pain to place something wrong
+                return placeBlockCost * 3;
+            } else {
+                if (hasThrowaway) {
+                    return placeBlockCost;
+                } else {
+                    return COST_INF;
+                }
+            }
+        }
+
+        @Override
+        public double breakCostMultiplierAt(int x, int y, int z, IBlockState current) {
+            if (!allowBreak || isPossiblyProtected(x, y, z)) {
+                return COST_INF;
+            }
+            IBlockState sch = getSchematic(x, y, z, current);
+            if (sch != null) {
+                if (sch.getBlock() == Blocks.AIR) {
+                    // it should be air
+                    // regardless of current contents, we can break it
+                    return 1;
+                }
+                // it should be a real block
+                // is it already that block?
+                if (valid(bsi.get0(x, y, z), sch, false)) {
+                    return Baritone.settings().breakCorrectBlockPenaltyMultiplier.value;
+                } else {
+                    // can break if it's wrong
+                    // would be great to return less than 1 here, but that would actually make the cost calculation messed up
+                    // since we're breaking a block, if we underestimate the cost, then it'll fail when it really takes the correct amount of time
+                    return 1;
+
+                }
+                // TODO do blocks in render distace only?
+                // TODO allow breaking blocks that we have a tool to harvest and immediately place back?
+            } else {
+                return 1; // why not lol
+            }
+        }
     }
 }
